@@ -34,13 +34,17 @@ JDK 21** before invoking Maven or the embedded Hazelcast cluster may hit reflect
 
 ## Architecture notes
 
-- **`EmptyMapCache`** (`src/main/java/.../throttle/`) is a static, process-wide utility.
-  `configure(HazelcastInstance)` is only needed for the `isEmpty(String)` overload;
-  `isEmpty(IMap)` caches the map reference and needs no configured instance. On a stale or
-  missing entry, refresh is **single-flight**: one caller calls through to `IMap.isEmpty()`
-  while concurrent callers return the last cached value, keeping underlying ops near one per
-  window even under heavy concurrency. A package-private `setClock(Clock)` hook makes the
-  staleness window deterministic in tests.
+- **`EmptyMapCache`** (`src/main/java/.../throttle/`) is a static utility whose cache is a
+  **distributed Hazelcast `IMap<String, CachedStatus>`** (default name `__EmptyMapCache`), so
+  a refresh by any client in the cluster is shared by all of them. `configure(HazelcastInstance)`
+  is therefore **required** before use. On a stale or missing entry, refresh is **single-flight
+  cluster-wide**: one caller takes the cache key's lock (`IMap.tryLock`) and calls through to
+  `IMap.isEmpty()` while concurrent callers (on any client) return the last cached value,
+  keeping underlying ops near one per map per window even across many clients. Freshness is a
+  timestamp comparison, so member clocks should be NTP-synced (skew ≪ staleness). A
+  package-private `setClock(Clock)` hook makes the staleness window deterministic in tests.
+  Trade-off: each call is now a remote single-key `get` on the cache map rather than a local
+  read — far cheaper than the `isEmpty()` fan-out, but not free.
 - **Staleness semantics:** an entry is served from cache while
   `now - timestamp < maxStaleness`; otherwise it refreshes. (The original brief stated this
   condition inverted — the implemented behavior is the corrected version.)

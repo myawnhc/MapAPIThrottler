@@ -115,6 +115,7 @@ class EmptyMapCacheTest {
         map.clear();
 
         MutableClock clock = new MutableClock(1_000_000L);
+        EmptyMapCache.configure(hz);
         EmptyMapCache.setClock(clock);
         EmptyMapCache.setMaxStalenessMillis(STALENESS_MILLIS);
         EmptyMapCache.clear();

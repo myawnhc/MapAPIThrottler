@@ -3,41 +3,50 @@ package com.theyawns.throttle;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.map.IMap;
 
+import java.io.Serial;
+import java.io.Serializable;
 import java.time.Clock;
 import java.time.Duration;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * A throttling cache in front of {@link IMap#isEmpty()}.
+ * A throttling cache in front of {@link IMap#isEmpty()}, backed by a distributed
+ * Hazelcast {@link IMap} so that every client in the cluster shares the result.
  *
  * <p>{@code IMap.isEmpty()} is a cluster-wide operation: each call fans out to every
  * partition on every member. Applications that poll it at high frequency can drive
  * significant load and latency. {@code EmptyMapCache} caches the boolean answer per map
- * name for a configurable <em>max staleness</em> window (default one second), so a burst
- * of thousands of calls per second collapses to roughly one underlying call per window.
+ * name for a configurable <em>max staleness</em> window (default one second). Because the
+ * cache itself is a distributed {@code IMap}, a refresh performed by any client is
+ * immediately visible to all of them, so the underlying fan-out happens at most about once
+ * per map per window across the whole cluster.
  *
  * <p>Typical use:
  * <pre>{@code
- * EmptyMapCache.configure(hazelcastInstance);   // needed only for the String overload
+ * EmptyMapCache.configure(hazelcastInstance);   // required: the cache lives in the cluster
  * if (EmptyMapCache.isEmpty("MyMap")) { ... }
  * // or, when you already hold the map:
  * if (EmptyMapCache.isEmpty(myMap)) { ... }
  * }</pre>
  *
- * <p>The cache is shared process-wide via static state and is safe for concurrent use.
- * When an entry is stale, a single caller refreshes it ("single-flight") while other
- * callers continue to receive the last cached value, so the underlying operation count
- * stays at about one per map per staleness window regardless of call concurrency.
+ * <p>When an entry is stale, refresh is <em>single-flight cluster-wide</em>: one caller
+ * acquires the cache key's lock and refreshes while every other caller (on any client)
+ * continues to receive the last cached value, keeping the underlying operation count at
+ * about one per map per window regardless of how many clients poll.
+ *
+ * <p>Freshness is judged from a timestamp stamped at refresh time. Across multiple hosts
+ * this assumes member clocks are reasonably synchronized (skew should be well under the
+ * staleness window); a synchronized clock source such as NTP is sufficient.
  */
 public final class EmptyMapCache {
 
     /** Default maximum staleness applied until {@link #setMaxStaleness} is called. */
     public static final long DEFAULT_MAX_STALENESS_MILLIS = 1_000L;
 
-    private static final ConcurrentHashMap<String, CachedValue> CACHE = new ConcurrentHashMap<>();
+    /** Default name of the distributed map that holds cached results. */
+    public static final String DEFAULT_CACHE_MAP_NAME = "__EmptyMapCache";
 
     private static volatile HazelcastInstance hazelcastInstance;
+    private static volatile String cacheMapName = DEFAULT_CACHE_MAP_NAME;
     private static volatile long maxStalenessMillis = DEFAULT_MAX_STALENESS_MILLIS;
     private static volatile Clock clock = Clock.systemUTC();
 
@@ -49,12 +58,20 @@ public final class EmptyMapCache {
     // ---------------------------------------------------------------------
 
     /**
-     * Sets the Hazelcast instance used to resolve a map by name in {@link #isEmpty(String)}.
-     * Not required if every call passes an {@link IMap}, since the map reference is then
-     * cached and reused for refreshes.
+     * Sets the Hazelcast instance that hosts the shared cache and resolves target maps by
+     * name. Required before any {@code isEmpty(...)} call.
      */
     public static void configure(HazelcastInstance instance) {
+        configure(instance, DEFAULT_CACHE_MAP_NAME);
+    }
+
+    /**
+     * Sets the Hazelcast instance and the name of the distributed map used to hold cached
+     * results. Use a distinct cache map name to isolate independent caches on one cluster.
+     */
+    public static void configure(HazelcastInstance instance, String cacheMapName) {
         hazelcastInstance = instance;
+        EmptyMapCache.cacheMapName = cacheMapName;
     }
 
     /** Sets the maximum staleness window. Must be positive. */
@@ -75,9 +92,12 @@ public final class EmptyMapCache {
         return maxStalenessMillis;
     }
 
-    /** Drops all cached entries. Subsequent calls refresh from the underlying maps. */
+    /** Drops all cached entries across the cluster. Subsequent calls refresh from the underlying maps. */
     public static void clear() {
-        CACHE.clear();
+        HazelcastInstance instance = hazelcastInstance;
+        if (instance != null) {
+            instance.getMap(cacheMapName).clear();
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -85,19 +105,19 @@ public final class EmptyMapCache {
     // ---------------------------------------------------------------------
 
     /**
-     * Returns whether the named map is empty, served from cache when fresh.
+     * Returns whether the named map is empty, served from the shared cache when fresh.
      *
-     * @throws IllegalStateException if no Hazelcast instance has been configured and the
-     *                               map has not previously been seen via {@link #isEmpty(IMap)}
+     * @throws IllegalStateException if no Hazelcast instance has been configured
      */
     public static boolean isEmpty(String mapName) {
         return lookup(mapName, null);
     }
 
     /**
-     * Returns whether the given map is empty, served from cache when fresh.
-     * The map reference is remembered so later refreshes (and {@link #isEmpty(String)}
-     * calls for the same name) do not require a configured instance.
+     * Returns whether the given map is empty, served from the shared cache when fresh.
+     * The supplied map is used directly for any refresh, avoiding a name lookup.
+     *
+     * @throws IllegalStateException if no Hazelcast instance has been configured
      */
     public static boolean isEmpty(IMap<?, ?> map) {
         return lookup(map.getName(), map);
@@ -107,58 +127,81 @@ public final class EmptyMapCache {
     // Internals
     // ---------------------------------------------------------------------
 
-    private static boolean lookup(String mapName, IMap<?, ?> map) {
-        CachedValue entry = CACHE.computeIfAbsent(mapName, name -> new CachedValue());
-        if (map != null) {
-            entry.map = map;
+    private static boolean lookup(String mapName, IMap<?, ?> target) {
+        IMap<String, CachedStatus> cache = cacheMap();
+        CachedStatus current = cache.get(mapName);
+        if (isFresh(current)) {
+            return current.empty();
         }
-
-        if (entry.initialized && !isStale(entry)) {
-            return entry.empty;
-        }
-        return refresh(mapName, entry);
+        return refresh(cache, mapName, target, current);
     }
 
-    private static boolean isStale(CachedValue entry) {
-        return clock.millis() - entry.timestampMillis >= maxStalenessMillis;
+    private static boolean isFresh(CachedStatus status) {
+        return status != null && clock.millis() - status.timestampMillis() < maxStalenessMillis;
     }
 
-    private static boolean refresh(String mapName, CachedValue entry) {
-        if (entry.refreshing.compareAndSet(false, true)) {
+    private static boolean refresh(IMap<String, CachedStatus> cache, String mapName,
+                                   IMap<?, ?> target, CachedStatus stale) {
+        // Single-flight cluster-wide: only the holder of the key lock calls through.
+        if (cache.tryLock(mapName)) {
             try {
-                boolean empty = resolveMap(mapName, entry).isEmpty();
-                entry.empty = empty;
-                entry.timestampMillis = clock.millis();
-                entry.initialized = true;
-                return empty;
+                CachedStatus current = cache.get(mapName);
+                if (isFresh(current)) {
+                    return current.empty();
+                }
+                return computeAndStore(cache, mapName, target);
             } finally {
-                entry.refreshing.set(false);
+                cache.unlock(mapName);
             }
         }
 
-        // Another caller is refreshing. If we already have a value, return it (it is at
-        // most one staleness window old by construction). On the very first load there is
-        // no value yet, so wait for the winner to publish one.
-        while (!entry.initialized) {
-            Thread.onSpinWait();
+        // Another client is refreshing. If we have a prior value, serve it (at most one
+        // staleness window old). Otherwise this is the first load anywhere, so wait for it.
+        if (stale != null) {
+            return stale.empty();
         }
-        return entry.empty;
+        cache.lock(mapName);
+        try {
+            CachedStatus current = cache.get(mapName);
+            if (current != null) {
+                return current.empty();
+            }
+            return computeAndStore(cache, mapName, target);
+        } finally {
+            cache.unlock(mapName);
+        }
     }
 
-    private static IMap<?, ?> resolveMap(String mapName, CachedValue entry) {
-        IMap<?, ?> map = entry.map;
-        if (map != null) {
-            return map;
+    private static boolean computeAndStore(IMap<String, CachedStatus> cache, String mapName, IMap<?, ?> target) {
+        boolean empty = resolveTarget(mapName, target).isEmpty();
+        cache.set(mapName, new CachedStatus(empty, clock.millis()));
+        return empty;
+    }
+
+    private static IMap<?, ?> resolveTarget(String mapName, IMap<?, ?> target) {
+        if (target != null) {
+            return target;
         }
+        return requireInstance().getMap(mapName);
+    }
+
+    private static IMap<String, CachedStatus> cacheMap() {
+        // Every isEmpty() served from cache costs one remote single-key get here. Configuring
+        // a near-cache on this map would make repeat reads local (memory speed), recovering
+        // most of the throughput a purely local cache had. The trade-off is additional
+        // staleness: a near-cache serves its own copy until invalidated, so an entry can be
+        // read slightly past our maxStaleness window (bounded by the near-cache's own
+        // time-to-live / invalidation settings). Keep the near-cache TTL at or below
+        // maxStaleness if that extra slack is unacceptable.
+        return requireInstance().getMap(cacheMapName);
+    }
+
+    private static HazelcastInstance requireInstance() {
         HazelcastInstance instance = hazelcastInstance;
         if (instance == null) {
-            throw new IllegalStateException(
-                    "No HazelcastInstance configured; call EmptyMapCache.configure(...) "
-                            + "or invoke isEmpty(IMap) at least once for map '" + mapName + "'");
+            throw new IllegalStateException("No HazelcastInstance configured; call EmptyMapCache.configure(...)");
         }
-        map = instance.getMap(mapName);
-        entry.map = map;
-        return map;
+        return instance;
     }
 
     /** Package-private hook for deterministic testing of the staleness window. */
@@ -166,11 +209,9 @@ public final class EmptyMapCache {
         clock = newClock;
     }
 
-    private static final class CachedValue {
-        private final AtomicBoolean refreshing = new AtomicBoolean(false);
-        private volatile boolean initialized;
-        private volatile boolean empty;
-        private volatile long timestampMillis;
-        private volatile IMap<?, ?> map;
+    /** Cached empty-status for one map, stored in the distributed cache map. */
+    private record CachedStatus(boolean empty, long timestampMillis) implements Serializable {
+        @Serial
+        private static final long serialVersionUID = 1L;
     }
 }
