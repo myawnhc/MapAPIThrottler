@@ -1,4 +1,8 @@
 target/
+
+### Local-only tooling notes ###
+CLAUDE.md
+
 !.mvn/wrapper/maven-wrapper.jar
 !**/src/main/**/target/
 !**/src/test/**/target/
